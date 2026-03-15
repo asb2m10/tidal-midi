@@ -1,91 +1,138 @@
-{-|
-Entry functions for interacting with MIDI devices through Tidal.
--}
-module Sound.Tidal.MIDI.Stream (midiStream, midiBackend, midiState, midiSetters, midiDevices, displayOutputDevices) where
+module Sound.Tidal.MIDI.Stream (
+  startMidiStream,
+  attachMidi,
+) where
 
--- generics
-import           Control.Concurrent
-import           Control.Concurrent.MVar ()
-import qualified Data.Map as Map
+import Control.Concurrent.MVar
+import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 
--- Tidal specific
-import           Sound.Tidal.Stream as S
-import           Sound.Tidal.Time
-import           Sound.Tidal.Transition (transition)
+import qualified Sound.Tidal.Clock as Clock
+import qualified Sound.Tidal.Link as Link
+import Sound.Tidal.Config (Config, toClockConfig)
+import Sound.Tidal.Pattern
+import Sound.Tidal.Stream.Process (playStack)
+import Sound.Tidal.Stream.Types (Stream (..), PlayMap)
 
--- MIDI specific
-import           Sound.Tidal.MIDI.Control
-import           Sound.Tidal.MIDI.Output
+import Sound.Tidal.MIDI.Output
 
+-- | Start a Tidal 'Stream' that sends MIDI note events instead of OSC.
+-- The returned 'Stream' is compatible with all standard tidal functions
+-- ('d1', 'hush', 'cps', etc.).
+--
+-- Example:
+--
+-- > stream <- startMidiStream "My Synth" defaultConfig
+-- > let d1 = streamReplace stream "d1"
+-- > d1 $ note "0 3 7" # velocity "0.8"
+startMidiStream :: String  -- ^ PortMidi output device name
+                -> Config  -- ^ Tidal config (use 'defaultConfig' to start)
+                -> IO Stream
+startMidiStream deviceName config = do
+  eOut <- openMidiOutput deviceName
+  out  <- case eOut of
+    Left  err -> error err
+    Right o   -> return o
+  outMV     <- newMVar out
+  sMapMV    <- newMVar Map.empty
+  pMapMV    <- newMVar Map.empty
+  globalFMV <- newMVar id
+  clockRef  <- Clock.clocked (toClockConfig config)
+                              (midiTick outMV sMapMV pMapMV globalFMV)
+  return Stream
+    { sConfig    = config
+    , sStateMV   = sMapMV
+    , sClockRef  = clockRef
+    , sListen    = Nothing
+    , sPMapMV    = pMapMV
+    , sGlobalFMV = globalFMV
+    , sCxs       = []
+    }
 
-{-|
-Create a handle for all currently used 'Output's indexed by their device name.
+-- | Attach a MIDI output to an existing tidal 'Stream'.
+-- The MIDI output will follow the same patterns as the stream, so the
+-- standard 'd1', 'd2', 'hush', 'cps' etc. functions drive MIDI automatically.
+--
+-- Typical boot usage:
+--
+-- > tidalInst <- mkTidal
+-- > attachMidi "IAC Driver Bus 1" tidalInst
+-- > instance Tidally where tidal = tidalInst
+attachMidi :: String -> Stream -> IO ()
+attachMidi deviceName tidalStream = do
+  eOut <- openMidiOutput deviceName
+  out  <- case eOut of
+    Left  err -> error err
+    Right o   -> return o
+  outMV  <- newMVar out
+  sMapMV <- newMVar Map.empty
+  _      <- Clock.clocked (toClockConfig (sConfig tidalStream))
+                          (midiTick outMV sMapMV (sPMapMV tidalStream) (sGlobalFMV tidalStream))
+  return ()
 
-We use this to cache once opened devices.
+-- Internal tick handler, called by the Tidal clock on every arc.
+midiTick :: MVar MidiOutput
+         -> MVar ValueMap
+         -> MVar PlayMap
+         -> MVar (ControlPattern -> ControlPattern)
+         -> Clock.TickAction
+midiTick outMV stateMV playMV globalFMV (st, end) nudge cconf cref (ss, _) = do
+  out      <- readMVar outMV
+  pMap     <- readMVar playMV
+  sGlobalF <- readMVar globalFMV
+  bpm      <- Clock.getTempo ss
+  let cps          = Clock.beatToCycles cconf (fromRational bpm) / 60
+      cycleLatency = toRational (nudge / cps)
+      patstack     = rotR cycleLatency $ sGlobalF $ playStack pMap
+  sMap <- takeMVar stateMV
+  let sMap'         = Map.insert "_cps" (VF cps) sMap
+      es            = filter eventHasOnset $
+                        query patstack (State { arc = Arc st end, controls = sMap' })
+      (sMap'', es') = resolveState sMap' es
+  putMVar stateMV sMap''
+  let al = Clock.rAbletonLink cref
+  notes <- mapM (toNote cconf ss) es'
+  sendNotes out al notes
 
-This will be passed to _every_ initialization of a virtual stream to a MIDI device
-and is necessary since, 'PortMidi' only allows a single connection to a device.
--}
-midiDevices :: IO (MVar MidiDeviceMap)
-midiDevices = newMVar $ Map.fromList []
+toNote :: Clock.ClockConfig -> Link.SessionState -> Event ValueMap
+       -> IO (Int, Int, Int, Link.Micros, Link.Micros)
+toNote cconf ss e = do
+  let vm      = value e
+      wope    = wholeOrPart e
+      onBeat  = Clock.cyclesToBeat cconf (realToFrac (start wope))
+      offBeat = Clock.cyclesToBeat cconf (realToFrac (stop  wope))
+  onLink  <- Clock.timeAtBeat cconf ss onBeat
+  offLink <- Clock.timeAtBeat cconf ss offBeat
+  return (chanFromVM vm, noteFromVM vm, velFromVM vm, onLink, offLink)
 
+-- ---------------------------------------------------------------------------
+-- ValueMap helpers
 
-{-|
-Connect to a MIDI device with a given name and channel,
-using a 'ControllerShape' to allow customized interaction
-with specific MIDI synths.
+noteFromVM :: ValueMap -> Int
+noteFromVM vm = clamp 0 127 $ case Map.lookup "n" vm of
+  Just (VN (Note n)) -> round n + 60
+  Just (VF n)        -> round n + 60
+  Just (VI n)        -> n + 60
+  _                  -> fromMaybe 60 $ do
+    v <- Map.lookup "note" vm
+    case v of
+      VN (Note n) -> Just (round n + 60)
+      VF n        -> Just (round n)
+      VI n        -> Just n
+      _           -> Nothing
 
-Needs a 'MidiDeviceMap' to operate, create on using 'midiDevices'!
+velFromVM :: ValueMap -> Int
+velFromVM vm = clamp 0 127 $ case Map.lookup "velocity" vm of
+  Just (VF v) -> round (v * 127)
+  _           -> case Map.lookup "gain" vm of
+    Just (VF g) -> round (g * 127)
+    _           -> 100
 
-Usage:
+chanFromVM :: ValueMap -> Int
+chanFromVM vm = clamp 1 16 $ case Map.lookup "channel" vm of
+  Just (VI c) -> c
+  Just (VF c) -> round c
+  _           -> 1
 
-@
-(m1, mt1) <- midiSetters devices "My Synth Controller Device name" 1 synthController getNow
-@
-
-To find the correct name for your device see 'displayOutputDevices'
--}
-midiSetters :: MVar MidiDeviceMap -- ^ A list of MIDI output devices
-            -> String -- ^ The name of the output device to connect
-            -> Int -- ^ The MIDI Channel to use
-            -> ControllerShape -- ^ The definition of params to be usable
-            -> IO Time -- ^ a method to get the current time
-            -> IO (ParamPattern -> IO (), (Time -> [ParamPattern] -> ParamPattern) -> ParamPattern -> IO ())
-midiSetters d n c s getNow = do
-  ds <- midiState d n c s
-  return (setter ds, transition getNow ds)
-
-
-{-|
-Creates a single virtual stream to a MIDI device using a specific 'ControllerShape'
-
-Needs a 'MidiDeviceMap' to operate, create one using 'midiDevices'!
--}
-midiStream :: MVar MidiDeviceMap -> String -> Int -> ControllerShape -> IO (ParamPattern -> IO ())
-midiStream d n c s = do
-  backend <- midiBackend d n c s
-  stream backend (toShape s)
-
-{-|
-Creates a single virtual state for a MIDI device using a specific 'ControllerShape'
-
-This state can be used to either create a 'Sound.Tidal.Stream.setter' or a 'Sound.Tidal.Transition.transition' from it.
-
-Needs a 'MidiDeviceMap' to operate, create one using 'midiDevices'!
--}
-midiState :: MVar MidiDeviceMap -> String -> Int -> ControllerShape -> IO (MVar (ParamPattern, [ParamPattern]))
-midiState d n c s = do
-  backend <- midiBackend d n c s
-  S.state backend (toShape s)
-
-
-{-|
-Opens a connection to a MIDI device and wraps it in a 'Sound.Tidal.Stream.Backend' implementation.
-
-Needs a 'MidiDeviceMap' to operate, create one using 'midiDevices'!
--}
-midiBackend :: MVar MidiDeviceMap -> String -> Int -> ControllerShape -> IO (Backend a)
-midiBackend d n c cs = do
-  (s, o) <- makeConnection d n c cs
-  return $ Backend s (flushBackend o)
-
+clamp :: Int -> Int -> Int -> Int
+clamp lo hi = max lo . min hi
