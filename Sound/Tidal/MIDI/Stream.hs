@@ -3,10 +3,18 @@ module Sound.Tidal.MIDI.Stream (
   attachMidi,
 ) where
 
+import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar
+import Control.Monad (when)
+import Data.Bits
+import Data.Int (Int64)
+import Data.List (sortBy)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
+import Data.Ord (comparing)
+import Foreign.C.Types (CULong)
 
+import qualified Sound.PortMidi as PM
 import qualified Sound.Tidal.Clock as Clock
 import qualified Sound.Tidal.Link as Link
 import Sound.Tidal.Config (Config, toClockConfig)
@@ -58,6 +66,8 @@ startMidiStream deviceName config = do
 -- > tidalInst <- mkTidal
 -- > attachMidi "IAC Driver Bus 1" tidalInst
 -- > instance Tidally where tidal = tidalInst
+-- | Attach a MIDI output to an existing tidal 'Stream'.
+-- Reuses the stream's AbletonLink instance so no extra Link peer appears in the DAW.
 attachMidi :: String -> Stream -> IO ()
 attachMidi deviceName tidalStream = do
   eOut <- openMidiOutput deviceName
@@ -66,9 +76,44 @@ attachMidi deviceName tidalStream = do
     Right o   -> return o
   outMV  <- newMVar out
   sMapMV <- newMVar Map.empty
-  _      <- Clock.clocked (toClockConfig (sConfig tidalStream))
-                          (midiTick outMV sMapMV (sPMapMV tidalStream) (sGlobalFMV tidalStream))
+  let cref = sClockRef tidalStream
+      conf = toClockConfig (sConfig tidalStream)
+  _ <- forkIO $ midiClock conf cref outMV sMapMV
+                           (sPMapMV tidalStream) (sGlobalFMV tidalStream)
   return ()
+
+-- | Clock loop that shares the tidal stream's AbletonLink instance.
+-- Mirrors the essential logic of Clock.clocked without calling Link.create.
+midiClock :: Clock.ClockConfig -> Clock.ClockRef
+          -> MVar MidiOutput -> MVar ValueMap
+          -> MVar PlayMap -> MVar (ControlPattern -> ControlPattern)
+          -> IO ()
+midiClock conf cref outMV stateMV playMV globalFMV = do
+  let al      = Clock.rAbletonLink cref
+      frameUs = round (Clock.clockFrameTimespan conf * 1000000) :: Int64
+  startTime <- Link.clock al
+  loop al frameUs startTime 0 (0, 0)
+  where
+    loop al frameUs startTime ticks' nowArc = do
+      let logicalEnd  = Clock.logicalTime conf startTime (ticks' + 1)
+          arcStartCyc = snd nowArc
+      ss           <- Clock.getSessionState cref
+      arcStartTime <- Clock.cyclesToTime conf ss arcStartCyc
+      newArc <-
+        if arcStartTime < logicalEnd
+          then do
+            endCycle <- Clock.timeToCycles conf ss logicalEnd
+            let arc = (arcStartCyc, endCycle)
+            midiTick outMV stateMV playMV globalFMV arc 0 conf cref (ss, ss)
+            Link.destroySessionState ss
+            return arc
+          else do
+            Link.destroySessionState ss
+            return nowArc
+      now <- Link.clock al
+      let delta = min frameUs (max 0 (logicalEnd - now))
+      when (delta > 0) $ threadDelay (fromIntegral delta)
+      loop al frameUs startTime (ticks' + 1) newArc
 
 -- Internal tick handler, called by the Tidal clock on every arc.
 midiTick :: MVar MidiOutput
@@ -91,19 +136,33 @@ midiTick outMV stateMV playMV globalFMV (st, end) nudge cconf cref (ss, _) = do
       (sMap'', es') = resolveState sMap' es
   putMVar stateMV sMap''
   let al = Clock.rAbletonLink cref
-  notes <- mapM (toNote cconf ss) es'
-  sendNotes out al notes
+  eventPairs <- mapM (toMidiEvents cconf ss al) es'
+  let sorted = sortBy (comparing PM.timestamp) (concatMap (\(a, b) -> [a, b]) eventPairs)
+  writeMidiEvents out sorted
 
-toNote :: Clock.ClockConfig -> Link.SessionState -> Event ValueMap
-       -> IO (Int, Int, Int, Link.Micros, Link.Micros)
-toNote cconf ss e = do
+-- | Convert one tidal event to a (note-on, note-off) pair of PortMidi events.
+-- Timing reference (linkNow/pmNow) is sampled immediately after timeAtBeat,
+-- mirroring how processCps calls linkToOscTime right after timeAtBeat per event.
+toMidiEvents :: Clock.ClockConfig -> Link.SessionState -> Link.AbletonLink
+             -> Event ValueMap
+             -> IO (PM.PMEvent, PM.PMEvent)
+toMidiEvents cconf ss al e = do
   let vm      = value e
       wope    = wholeOrPart e
       onBeat  = Clock.cyclesToBeat cconf (realToFrac (start wope))
       offBeat = Clock.cyclesToBeat cconf (realToFrac (stop  wope))
   onLink  <- Clock.timeAtBeat cconf ss onBeat
+  -- Sample timing reference immediately after timeAtBeat (mirrors linkToOscTime)
+  linkNow <- Link.clock al
+  pmNow   <- PM.time
   offLink <- Clock.timeAtBeat cconf ss offBeat
-  return (chanFromVM vm, noteFromVM vm, velFromVM vm, onLink, offLink)
+  let toPm t  = pmNow + fromIntegral (max 0 ((t - linkNow) `div` 1000)) :: CULong
+      ch = fromIntegral (chanFromVM vm - 1)
+      n  = fromIntegral (noteFromVM vm)
+      v  = fromIntegral (velFromVM vm)
+      onEv  = PM.PMEvent (PM.encodeMsg (PM.PMMsg (0x90 .|. ch) n v)) (toPm onLink)
+      offEv = PM.PMEvent (PM.encodeMsg (PM.PMMsg (0x80 .|. ch) n 0)) (toPm offLink)
+  return (onEv, offEv)
 
 -- ---------------------------------------------------------------------------
 -- ValueMap helpers

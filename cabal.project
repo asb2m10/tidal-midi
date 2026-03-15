@@ -1,0 +1,4 @@
+packages: .
+
+package PortMidi
+  ghc-options: -optc-Wno-int-conversion -optc-Wno-pointer-integer-compare -optc-Wno-void-pointer-to-int-cast -optc-Wno-int-to-void-pointer-cast -optc-Wno-format

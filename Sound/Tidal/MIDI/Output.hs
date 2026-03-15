@@ -2,15 +2,11 @@ module Sound.Tidal.MIDI.Output (
   MidiOutput(..),
   openMidiOutput,
   closeMidiOutput,
-  sendNotes,
+  writeMidiEvents,
 ) where
 
-import Data.Bits
-import Data.List (sortBy)
-import Data.Ord (comparing)
-import Foreign.C.Types (CLong, CULong)
+import Foreign.C.Types (CULong)
 import qualified Sound.PortMidi as PM
-import qualified Sound.Tidal.Link as Link
 
 data MidiOutput = MidiOutput
   { pmStream :: PM.PMStream
@@ -39,23 +35,8 @@ openMidiOutput name = do
 closeMidiOutput :: MidiOutput -> IO ()
 closeMidiOutput out = PM.close (pmStream out) >> return ()
 
--- | Schedule a batch of MIDI note on+off pairs in a single PortMidi write.
--- Timing is sampled once so all notes in the batch share the same reference,
--- which is required for chords to fire simultaneously.
--- Each tuple is (channel 1-16, note 0-127, velocity 0-127, onLink, offLink).
-sendNotes :: MidiOutput
-          -> Link.AbletonLink
-          -> [(Int, Int, Int, Link.Micros, Link.Micros)]
-          -> IO ()
-sendNotes _   _           []    = return ()
-sendNotes out abletonLink notes = do
-  linkNow <- Link.clock abletonLink
-  pmNow   <- PM.time
-  let toPm t  = pmNow + fromIntegral (max 0 ((t - linkNow) `div` 1000)) :: CULong
-      toEvents (ch, n, v, onL, offL) =
-        [ PM.PMEvent (PM.encodeMsg (PM.PMMsg (0x90 .|. fromIntegral (ch - 1)) (fromIntegral n) (fromIntegral v))) (toPm onL)
-        , PM.PMEvent (PM.encodeMsg (PM.PMMsg (0x80 .|. fromIntegral (ch - 1)) (fromIntegral n) 0))               (toPm offL)
-        ]
-      sorted = sortBy (comparing PM.timestamp) (concatMap toEvents notes)
-  _ <- PM.writeEvents (pmStream out) sorted
-  return ()
+-- | Write a pre-sorted batch of PortMidi events to the output stream.
+-- Callers are responsible for sorting by timestamp before calling.
+writeMidiEvents :: MidiOutput -> [PM.PMEvent] -> IO ()
+writeMidiEvents _   []     = return ()
+writeMidiEvents out events = PM.writeEvents (pmStream out) events >> return ()
